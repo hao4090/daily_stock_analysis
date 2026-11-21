@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-股票智能分析系统 - 大盘复盘模块（支持 A 股 / 港股 / 美股 / 日本 / 韩国）
+股票智能分析系统 - 大盘复盘模块（支持 A 股 / 港股 / 美股 / 日本 / 韩国 / 台股）
 ===================================
 
 职责：
-1. 根据 MARKET_REVIEW_REGION 配置选择市场区域（cn / hk / us / jp / kr / both）
+1. 根据 MARKET_REVIEW_REGION 配置选择市场区域（cn / hk / us / jp / kr / tw / both）
 2. 执行大盘复盘分析并生成复盘报告
 3. 保存和发送复盘报告
 """
 
 import logging
+import inspect
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +31,10 @@ from src.services.run_diagnostics import (
     record_notification_run,
 )
 from src.schemas.market_light import MARKET_LIGHT_REGIONS
+from src.utils.market_review_region import (
+    MARKET_REVIEW_REGION_ORDER,
+    normalize_market_review_region_lenient,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -42,9 +47,9 @@ _MARKET_REVIEW_MARKETS = (
     ('us', 'us_title', '美股'),
     ('jp', 'jp_title', '日股'),
     ('kr', 'kr_title', '韩股'),
+    ('tw', 'tw_title', '台股'),
 )
-_MARKET_REVIEW_REGION_ORDER = tuple(market for market, _, _ in _MARKET_REVIEW_MARKETS)
-_VALID_MARKET_REVIEW_REGIONS = frozenset(_MARKET_REVIEW_REGION_ORDER)
+_MARKET_REVIEW_REGION_ORDER = MARKET_REVIEW_REGION_ORDER
 
 
 @dataclass
@@ -119,6 +124,7 @@ def _get_market_review_text(language: str) -> dict[str, str]:
             "hk_title": "# HK Market Recap",
             "jp_title": "# Japan Market Recap",
             "kr_title": "# Korea Market Recap",
+            "tw_title": "# Taiwan Market Recap",
             "separator": "> Next market recap follows",
         }
     if normalized == "ko":
@@ -130,6 +136,7 @@ def _get_market_review_text(language: str) -> dict[str, str]:
             "hk_title": "# 홍콩 시황 리뷰",
             "jp_title": "# 일본 시황 리뷰",
             "kr_title": "# 한국 시황 리뷰",
+            "tw_title": "# 대만 시황 리뷰",
             "separator": "> 다음 시장 시황 리뷰",
         }
     return {
@@ -140,6 +147,7 @@ def _get_market_review_text(language: str) -> dict[str, str]:
         "hk_title": "# 港股大盘复盘",
         "jp_title": "# 日股大盘复盘",
         "kr_title": "# 韩股大盘复盘",
+        "tw_title": "# 台股大盘复盘",
         "separator": "> 以下为下一市场大盘复盘",
     }
 
@@ -153,22 +161,18 @@ def _get_market_review_market_heading(language: Any, market: str) -> str:
     return str(review_text.get(title_key) or market.upper()).lstrip("#").strip()
 
 
+def _market_review_region_metadata(region: Any) -> str:
+    normalized = str(region or "").strip().lower()
+    if normalized in {market for market, _, _ in _MARKET_REVIEW_MARKETS}:
+        return f"[dsa-market-region]: # ({normalized})\n\n"
+    return ""
+
+
 def _resolve_market_review_regions(raw_region: Optional[str]) -> list[str]:
     """Normalize MARKET_REVIEW_REGION into an ordered, non-empty region list."""
 
-    region = str(raw_region or 'cn').strip().lower()
-    if region == 'both':
-        return list(_MARKET_REVIEW_REGION_ORDER)
-    if ',' in region:
-        requested = {
-            item.strip().lower()
-            for item in region.split(',')
-            if item.strip().lower() in _VALID_MARKET_REVIEW_REGIONS
-        }
-        return [market for market in _MARKET_REVIEW_REGION_ORDER if market in requested] or ['cn']
-    if region in _VALID_MARKET_REVIEW_REGIONS:
-        return [region]
-    return ['cn']
+    normalized = normalize_market_review_region_lenient(raw_region) or "cn"
+    return normalized.split(",")
 
 
 def run_market_review(
@@ -365,7 +369,19 @@ def run_market_review(
                     wrapper_title=review_text["push_title"],
                 )
 
-                success = notifier.send(report_content, email_send_to_all=True, route_type="report")
+                send_kwargs: Dict[str, Any] = {
+                    "email_send_to_all": True,
+                    "route_type": "report",
+                }
+                try:
+                    supports_payload = (
+                        "structured_payload" in inspect.signature(notifier.send).parameters
+                    )
+                except (TypeError, ValueError):
+                    supports_payload = False
+                if supports_payload:
+                    send_kwargs["structured_payload"] = market_review_payload
+                success = notifier.send(report_content, **send_kwargs)
                 _record_market_review_notification_run(
                     query_id=history_query_id,
                     channel="report",
@@ -505,10 +521,11 @@ def _render_market_review_payload_markdown(
     wrapper_title: Optional[str] = None,
 ) -> str:
     """Render Markdown from the structured market-review payload for file/push compatibility."""
+    metadata = _market_review_region_metadata(payload.get("region"))
     body = _render_market_review_payload_body(payload)
     if wrapper_title:
-        return f"{wrapper_title}\n\n{body}".strip()
-    return body.strip()
+        return f"{metadata}{wrapper_title}\n\n{body}".strip()
+    return f"{metadata}{body}".strip()
 
 
 def _render_market_review_merge_markdown(

@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from src.config import Config
+from src.formatters import strip_hidden_markdown_metadata
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,11 @@ def resolve_gotify_message_endpoint(gotify_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
 
-    parsed = urlparse(raw_url)
+    try:
+        parsed = urlparse(raw_url)
+        _ = parsed.port
+    except ValueError:
+        return None
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
     if parsed.query or parsed.fragment:
@@ -77,6 +82,7 @@ class GotifySender:
         if title is None:
             date_str = datetime.now().strftime("%Y-%m-%d")
             title = f"📈 股票分析报告 - {date_str}"
+        sanitized_content = strip_hidden_markdown_metadata(content).strip()
 
         headers = {
             "Content-Type": "application/json; charset=utf-8",
@@ -85,7 +91,7 @@ class GotifySender:
         }
         payload = {
             "title": title,
-            "message": content,
+            "message": sanitized_content,
             "extras": {
                 "client::display": {
                     "contentType": "text/markdown",

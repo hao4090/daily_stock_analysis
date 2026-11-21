@@ -15,7 +15,8 @@ import logging
 from typing import List, Optional
 
 from src.agent.agents.base_agent import BaseAgent
-from src.agent.protocols import AgentContext, AgentOpinion, normalize_decision_signal
+from src.agent.disagreement import opinion_evidence_id
+from src.agent.protocols import AgentContext, AgentOpinion, StageStatus, normalize_decision_signal
 from src.report_language import normalize_report_language
 
 logger = logging.getLogger(__name__)
@@ -172,21 +173,54 @@ should sum to 100; all-zero means no effective signal and must not be faked.
                 "",
             ]
 
-        # Feed prior opinions
+        # Feed prior opinions — Orchestrator已在 _partition_skill_opinions 中完成
+        # skill 观点的分拣，ctx.opinions 中不再含 invalid skill opinion；
+        # invalid skill 观点存于 ctx.meta["invalid_opinions"]。
+        # DecisionAgent 直接消费，不再二次过滤。
+        debate_brief = ctx.meta.get("evidence_debate_brief")
         if ctx.opinions:
-            parts.append("## Agent Opinions")
-            for op in ctx.opinions:
-                parts.append(f"\n### {op.agent_name}")
+            parts.append("## Agent Opinions (Evidence Chain)")
+            for index, op in enumerate(ctx.opinions):
+                heading = opinion_evidence_id(op, index) if debate_brief else op.agent_name
+                parts.append(f"\n### {heading}")
                 parts.append(f"Signal: {op.signal} | Confidence: {op.confidence:.2f}")
                 parts.append(f"Reasoning: {op.reasoning}")
+                if debate_brief and op.source_evidence_ids:
+                    parts.append(f"Source tool calls: {', '.join(op.source_evidence_ids[:3])}")
                 if op.key_levels:
                     parts.append(f"Key levels: {json.dumps(op.key_levels)}")
                 if op.raw_data:
                     extra_keys = {k: v for k, v in op.raw_data.items()
-                                  if k not in ("signal", "confidence", "reasoning", "key_levels")}
+                                  if k not in ("signal", "confidence", "reasoning", "key_levels", "invalid_signal")}
                     if extra_keys:
                         parts.append(f"Extra data: {json.dumps(extra_keys, ensure_ascii=False, default=str)}")
                 parts.append("")
+
+        invalid_opinions = ctx.meta.get("invalid_opinions") or []
+        if invalid_opinions:
+            reason_labels = {
+                "skill_timeout": "执行超时",
+                "skill_error": "执行异常或未产出结构化观点",
+                "missing_signal": "signal 缺失",
+                "unrecognized_signal": "signal 无法识别",
+            }
+            reason_counts = {}
+            for item in invalid_opinions:
+                if not isinstance(item, dict):
+                    continue
+                reason = str(item.get("reason") or "unrecognized_signal")
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            reason_summary = "、".join(
+                f"{reason_labels.get(reason, reason)} {count} 个"
+                for reason, count in reason_counts.items()
+            )
+            parts.append("## Invalid Skill Opinions (Diagnostics only — not in evidence chain)")
+            parts.append(
+                f"共 {len(invalid_opinions)} 个 skill 观点未进入证据链"
+                f"（{reason_summary or '原因未分类'}）；"
+                f"仅供你在 data_limitations 中标注，不得作为决策依据。"
+            )
+            parts.append("")
 
         # Feed risk flags
         if ctx.risk_flags:
@@ -199,6 +233,27 @@ should sum to 100; all-zero means no effective signal and must not be faked.
         if isinstance(disagreement_summary, dict) and disagreement_summary:
             parts.append("## Agent Disagreement Summary")
             parts.append(json.dumps(disagreement_summary, ensure_ascii=False, default=str))
+            parts.append("")
+
+        if debate_brief:
+            parts.append("## Bull/Bear Evidence Debate")
+            parts.append(json.dumps(debate_brief, ensure_ascii=False, default=str))
+            parts.append(
+                "Weigh the available bull and bear arguments against the referenced opinions and sources. "
+                "References of the form opinion_id/field point to the named field of that opinion. "
+                "Use the risk review to examine downside when there is no opposing strategy opinion. "
+                "Explain which evidence drives the decision and identify evidence gaps."
+            )
+            if ctx.meta.get("risk_review_required"):
+                status = ctx.meta.get("risk_review_status", StageStatus.PENDING)
+                parts.append(f"Mandatory risk review status: {status.value}")
+                if status == StageStatus.COMPLETED:
+                    parts.append(
+                        "Address the risk review findings before recommending an action. "
+                        "If the enabled risk control plan vetoes buying, defer any buy or add recommendation."
+                    )
+                else:
+                    parts.append("Disclose that the mandatory risk review is incomplete and avoid an unreviewed buy recommendation.")
             parts.append("")
 
         # Skill meta

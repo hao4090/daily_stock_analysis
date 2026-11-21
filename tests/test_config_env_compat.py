@@ -7,12 +7,43 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, setup_env
+from src.config import Config, setup_env
 
 
 class ConfigEnvCompatibilityTestCase(unittest.TestCase):
     def tearDown(self):
         Config.reset_instance()
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_share_image_social_branding_is_optional_and_configurable(
+        self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "SHARE_IMAGE_XIAOHONGSHU_URL": "https://example.com/xhs",
+                "SHARE_IMAGE_XIAOHONGSHU_HANDLE": "@自定义账号",
+                "SHARE_IMAGE_XIAOHONGSHU_ID": "123456",
+                "SHARE_IMAGE_XIAOHONGSHU_QR_PATH": "assets/custom-xhs.png",
+            },
+            clear=True,
+        ):
+            configured = Config._load_from_env()
+
+        self.assertEqual(configured.share_image_xiaohongshu_url, "https://example.com/xhs")
+        self.assertEqual(configured.share_image_xiaohongshu_handle, "@自定义账号")
+        self.assertEqual(configured.share_image_xiaohongshu_id, "123456")
+        self.assertEqual(configured.share_image_xiaohongshu_qr_path, "assets/custom-xhs.png")
+
+        with patch.dict(os.environ, {}, clear=True):
+            disabled = Config._load_from_env()
+
+        self.assertIsNone(disabled.share_image_xiaohongshu_url)
+        self.assertIsNone(disabled.share_image_xiaohongshu_handle)
+        self.assertIsNone(disabled.share_image_xiaohongshu_id)
+        self.assertIsNone(disabled.share_image_xiaohongshu_qr_path)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -85,6 +116,12 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
         self.assertEqual(config.market_review_region, "cn,us,kr")
 
+    def test_market_review_region_keeps_legacy_mixed_both_and_empty_token_compatibility(self) -> None:
+        self.assertEqual(Config._parse_market_review_region("both,us"), "cn,hk,us,jp,kr,tw")
+        self.assertEqual(Config._parse_market_review_region("cn,,us"), "cn,us")
+        self.assertEqual(Config._parse_market_review_region("TW"), "tw")
+        self.assertEqual(Config._parse_market_review_region("tw,cn,invalid"), "cn,tw")
+
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_market_review_region_falls_back_to_cn_when_no_supported_tokens(
@@ -132,7 +169,25 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
         self.assertEqual(config.generation_backend, "litellm")
         self.assertEqual(config.generation_fallback_backend, "litellm")
+        self.assertEqual(config.agent_backend, "auto")
         self.assertEqual(config.agent_generation_backend, "auto")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_agent_backend_env_accepts_codex_app_server(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "AGENT_BACKEND": " CODEX_APP_SERVER ",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.agent_backend, "codex_app_server")
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -251,7 +306,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             config = Config._load_from_env()
 
         self.assertEqual(config.fundamental_stage_timeout_seconds, 8.0)
-        self.assertEqual(config.fundamental_fetch_timeout_seconds, 3.0)
+        self.assertEqual(config.fundamental_fetch_timeout_seconds, 8.0)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -284,16 +339,6 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             config = Config._load_from_env()
 
         self.assertEqual(config.schedule_times, [config.schedule_time])
-
-    @patch("src.config.setup_env")
-    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
-    def test_alphasift_install_spec_defaults_only_when_env_missing(
-        self, _mock_parse_litellm_yaml, _mock_setup_env
-    ):
-        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
-            config = Config._load_from_env()
-
-        self.assertEqual(config.alphasift_install_spec, DEFAULT_ALPHASIFT_INSTALL_SPEC)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -349,7 +394,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             "OPENAI_MODEL": "gpt-4.1",
             "OPENAI_BASE_URL": "https://openai.example.com/v1",
             "OPENAI_API_KEY": "base-key-12345",
-            "LITELLM_FALLBACK_MODELS": "openai/gpt-5.5,openai/gpt-4o-mini",
+            "LITELLM_FALLBACK_MODELS": "openai/gpt-6.1-sol,openai/gpt-4o-mini",
             "VISION_MODEL": "openai/gpt-4o-mini",
         }
         with patch.dict(os.environ, base_env, clear=True):
@@ -366,33 +411,6 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(with_jpkr.openai_model, baseline.openai_model)
         self.assertEqual(with_jpkr.openai_api_key, baseline.openai_api_key)
         self.assertEqual(with_jpkr.openai_base_url, baseline.openai_base_url)
-
-    def test_env_example_alphasift_install_spec_matches_trusted_default(self):
-        env_example = Path(__file__).resolve().parents[1] / ".env.example"
-
-        for line in env_example.read_text(encoding="utf-8").splitlines():
-            if line.startswith("ALPHASIFT_INSTALL_SPEC="):
-                self.assertEqual(
-                    line,
-                    f"ALPHASIFT_INSTALL_SPEC={DEFAULT_ALPHASIFT_INSTALL_SPEC}",
-                )
-                break
-        else:
-            self.fail("ALPHASIFT_INSTALL_SPEC missing from .env.example")
-
-    @patch("src.config.setup_env")
-    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
-    def test_alphasift_install_spec_honors_explicit_empty(
-        self, _mock_parse_litellm_yaml, _mock_setup_env
-    ):
-        with patch.dict(
-            os.environ,
-            {"STOCK_LIST": "600519", "ALPHASIFT_INSTALL_SPEC": ""},
-            clear=True,
-        ):
-            config = Config._load_from_env()
-
-        self.assertEqual(config.alphasift_install_spec, "")
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -536,8 +554,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             os.environ,
             {
                 "STOCK_LIST": "600519",
-                "LITELLM_MODEL": "openai/gpt-5.5",
-                "OPENAI_MODEL": "gpt-5.5",
+                "LITELLM_MODEL": "openai/gpt-6.1-sol",
+                "OPENAI_MODEL": "gpt-6.1-sol",
                 "OPENAI_API_KEY": "sk-openai-test",
                 "OPENAI_BASE_URL": "https://openai.example/v1",
                 "NEWS_INTEL_RETENTION_DAYS": "14",
@@ -550,8 +568,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         ):
             config = Config._load_from_env()
 
-        self.assertEqual(config.litellm_model, "openai/gpt-5.5")
-        self.assertEqual(config.openai_model, "gpt-5.5")
+        self.assertEqual(config.litellm_model, "openai/gpt-6.1-sol")
+        self.assertEqual(config.openai_model, "gpt-6.1-sol")
         self.assertEqual(config.openai_base_url, "https://openai.example/v1")
         self.assertEqual(config.news_intel_retention_days, 14)
         self.assertEqual(config.news_intel_fetch_timeout_sec, 12.0)
@@ -758,6 +776,121 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertFalse(config.schedule_run_immediately)
 
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_schedule_startup_dedup_process_env_overrides_env_file(
+        self,
+        _mock_parse_stock_email_groups,
+        _mock_parse_litellm_yaml,
+    ) -> None:
+        """SCHEDULE_STARTUP_DEDUP must carry the same bootstrap override
+        semantics as the other startup keys (SCHEDULE_RUN_IMMEDIATELY et
+        al.): a process env value that differs from the persisted .env —
+        docker run -e / compose environment / shell export — is an
+        intentional override and must win over the .env copy.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("SCHEDULE_STARTUP_DEDUP=true\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(env_path),
+                    "SCHEDULE_STARTUP_DEDUP": "false",
+                },
+                clear=True,
+            ):
+                config = Config._load_from_env()
+
+        self.assertFalse(
+            config.schedule_startup_dedup,
+            "process env SCHEDULE_STARTUP_DEDUP=false must override the "
+            ".env value",
+        )
+
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_schedule_startup_dedup_uses_env_file_when_process_env_absent(
+        self,
+        _mock_parse_stock_email_groups,
+        _mock_parse_litellm_yaml,
+    ) -> None:
+        """State 1 of the SCHEDULE_RUN_IMMEDIATELY-parity contract: with no
+        process env value at all, the persisted .env keeps governing the
+        kill switch (WebUI persistence stays authoritative)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("SCHEDULE_STARTUP_DEDUP=false\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"ENV_FILE": str(env_path)},
+                clear=True,
+            ):
+                config = Config._load_from_env()
+
+        self.assertFalse(config.schedule_startup_dedup)
+
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_schedule_startup_dedup_equal_values_do_not_shadow_env_edit(
+        self,
+        _mock_parse_stock_email_groups,
+        _mock_parse_litellm_yaml,
+    ) -> None:
+        """State 2: when the bootstrap process env value EQUALS the .env
+        value, the key must not be flagged as an explicit override, so a
+        later WebUI .env edit still takes effect on reload (same reload
+        flow as test_runtime_mutable_keys_prefer_env_file_after_restart)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("SCHEDULE_STARTUP_DEDUP=false\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(env_path),
+                    "SCHEDULE_STARTUP_DEDUP": "false",
+                },
+                clear=True,
+            ):
+                Config._load_from_env()
+                # WebUI persisted a new value into .env; process env stays.
+                env_path.write_text(
+                    "SCHEDULE_STARTUP_DEDUP=true\n", encoding="utf-8"
+                )
+                Config.reset_instance()
+                setup_env(override=True)
+                config = Config._load_from_env()
+
+        self.assertTrue(config.schedule_startup_dedup)
+
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_schedule_startup_dedup_process_env_wins_when_absent_from_file(
+        self,
+        _mock_parse_stock_email_groups,
+        _mock_parse_litellm_yaml,
+    ) -> None:
+        """State 3: a process env value for a key that .env does not carry
+        at all is a genuine explicit override and must be honoured."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(env_path),
+                    "SCHEDULE_STARTUP_DEDUP": "false",
+                },
+                clear=True,
+            ):
+                config = Config._load_from_env()
+
+        self.assertFalse(config.schedule_startup_dedup)
+
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_runtime_mutable_keys_use_process_env_when_absent_from_file(
         self,
         _mock_parse_yaml,
@@ -844,8 +977,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
                 "\n".join(
                     [
                         "STOCK_LIST=600519",
-                        "LITELLM_MODEL=openai/gpt-5.5",
-                        "OPENAI_MODEL=gpt-5.5",
+                        "LITELLM_MODEL=openai/gpt-6.1-sol",
+                        "OPENAI_MODEL=gpt-6.1-sol",
                         "OPENAI_API_KEY=runtime-openai-key",
                         "OPENAI_BASE_URL=https://openai.example/v1",
                         "CUSTOM_WEBHOOK_BODY_TEMPLATE={\"title\":$$title_json,\"content\":$$content_json}",
@@ -864,8 +997,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             ):
                 config = Config._load_from_env()
 
-        self.assertEqual(config.litellm_model, "openai/gpt-5.5")
-        self.assertEqual(config.openai_model, "gpt-5.5")
+        self.assertEqual(config.litellm_model, "openai/gpt-6.1-sol")
+        self.assertEqual(config.openai_model, "gpt-6.1-sol")
         self.assertEqual(config.openai_api_key, "runtime-openai-key")
         self.assertEqual(config.openai_base_url, "https://openai.example/v1")
         self.assertEqual(
@@ -923,7 +1056,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         )
         self.assertEqual(
             Config._parse_market_review_region("both"),
-            "cn,hk,us,jp,kr",
+            "cn,hk,us,jp,kr,tw",
         )
 
     @patch("src.config.setup_env")
@@ -996,6 +1129,48 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         stocks, emails = config.stock_email_groups[0]
         self.assertEqual(stocks, ["600519", "HK01810"])
         self.assertEqual(emails, ["user@example.com"])
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_env_example_has_no_nonempty_xxxx_placeholders_or_false_feishu_warnings(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        from dotenv import dotenv_values
+
+        env_example_path = Path(__file__).resolve().parents[1] / ".env.example"
+        parsed = dotenv_values(env_example_path)
+        bad_keys = [k for k, v in parsed.items() if (v or "").strip().lower() == "xxxx"]
+        self.assertEqual(bad_keys, [], f"Unexpected fake placeholder values in .env.example: {bad_keys}")
+
+        clean_env = {k: v for k, v in parsed.items() if v is not None}
+        clean_env["GEMINI_API_KEY"] = "test-gemini-key-123456"
+        clean_env["STOCK_LIST"] = "600519"
+        with patch.dict(os.environ, clean_env, clear=True):
+            cfg = Config._load_from_env()
+            issues = cfg.validate_structured()
+
+        feishu_warnings = [
+            i for i in issues
+            if i.severity == "warning" and "FEISHU_APP_ID" in i.message
+        ]
+        self.assertEqual(feishu_warnings, [])
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_missing_llm_config_issue_mentions_modelflare_key(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
+            cfg = Config._load_from_env()
+            issues = cfg.validate_structured()
+
+        llm_errors = [i for i in issues if i.severity == "error" and i.field == "LITELLM_CONFIG"]
+        self.assertTrue(llm_errors)
+        self.assertIn("MODELFLARE_KEY", llm_errors[0].message)
 
 
 if __name__ == "__main__":

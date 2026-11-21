@@ -12,9 +12,11 @@ A股自选股智能分析系统 - 搜索服务模块
 """
 
 import logging
+import multiprocessing
 import re
 import threading
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -38,9 +40,134 @@ from src.config import (
     normalize_news_strategy_profile,
     resolve_news_window_days,
 )
+from src.core.stock_execution_context import get_current_stock_cancellation, raise_if_stock_cancelled
+from src.data.stock_mapping import (
+    canonicalize_foreign_stock_code,
+    foreign_stock_english_aliases,
+)
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
 
 logger = logging.getLogger(__name__)
+
+_SEARCH_TIMEOUT_PROCESS_START_METHOD = "spawn"
+_SEARCH_TIMEOUT_PROCESS_JOIN_GRACE_SECONDS = 1.0
+_SEARCH_TIMEOUT_WORKER_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _terminate_search_process(process: Any) -> None:
+    """Stop and reap a search subprocess, escalating to kill when needed."""
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(_SEARCH_TIMEOUT_PROCESS_JOIN_GRACE_SECONDS)
+    if process.is_alive() and hasattr(process, "kill"):
+        process.kill()
+        process.join(_SEARCH_TIMEOUT_PROCESS_JOIN_GRACE_SECONDS)
+
+
+def _search_topic_news_process_worker(
+    conn: Any,
+    constructor_kwargs: Dict[str, Any],
+    topic: str,
+    max_results: int,
+    focus_keywords: Optional[List[str]],
+) -> None:
+    """Run the provider portion of a topic-news search in an isolated process."""
+    try:
+        service = SearchService(**constructor_kwargs)
+        response = service.search_topic_news(
+            topic,
+            max_results=max_results,
+            focus_keywords=focus_keywords,
+        )
+        conn.send((True, response))
+    except BaseException as exc:
+        try:
+            conn.send((False, exc))
+        except BaseException:
+            try:
+                conn.send((False, RuntimeError(f"{type(exc).__name__}: {exc}")))
+            except BaseException:
+                pass
+    finally:
+        conn.close()
+
+
+def _call_topic_news_in_subprocess(
+    *,
+    constructor_kwargs: Dict[str, Any],
+    topic: str,
+    max_results: int,
+    focus_keywords: Optional[List[str]],
+    timeout_seconds: float,
+    deadline: Optional[float] = None,
+) -> "SearchResponse":
+    """Execute a topic-news provider chain with a hard, process-level deadline."""
+    wait_seconds = max(0.01, float(timeout_seconds))
+    if not _SEARCH_TIMEOUT_WORKER_SLOTS.acquire(blocking=False):
+        raise RuntimeError("题材新闻搜索并发已满，请稍后重试")
+
+    process: Any = None
+    process_started = False
+    parent_conn: Any = None
+    child_conn: Any = None
+    try:
+        try:
+            multiprocessing.freeze_support()
+            ctx = multiprocessing.get_context(_SEARCH_TIMEOUT_PROCESS_START_METHOD)
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=_search_topic_news_process_worker,
+                args=(
+                    child_conn,
+                    constructor_kwargs,
+                    topic,
+                    max_results,
+                    focus_keywords,
+                ),
+                name="search-topic-news",
+                daemon=True,
+            )
+            process.start()
+            process_started = True
+            child_conn.close()
+            child_conn = None
+
+            poll_seconds = (
+                wait_seconds
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            if poll_seconds <= 0 or not parent_conn.poll(poll_seconds):
+                _terminate_search_process(process)
+                raise TimeoutError(f"题材新闻搜索超过 {wait_seconds:g}s，已终止请求进程")
+            try:
+                ok, value = parent_conn.recv()
+            except EOFError as exc:
+                raise RuntimeError("题材新闻搜索进程未返回结果") from exc
+        finally:
+            try:
+                if child_conn is not None:
+                    child_conn.close()
+            finally:
+                try:
+                    if parent_conn is not None:
+                        parent_conn.close()
+                finally:
+                    if process_started:
+                        try:
+                            process.join(_SEARCH_TIMEOUT_PROCESS_JOIN_GRACE_SECONDS)
+                        finally:
+                            _terminate_search_process(process)
+    finally:
+        # Capacity belongs to the accepted call, not to a successfully started
+        # process. Release it even if Process.start() or cleanup itself fails.
+        _SEARCH_TIMEOUT_WORKER_SLOTS.release()
+
+    if ok:
+        return value
+    raise value
+
 
 # Transient network errors (retryable)
 _SEARCH_TRANSIENT_EXCEPTIONS = (
@@ -117,6 +244,7 @@ class SearchResult:
     relevance_score: Optional[int] = None
     relevance_category: Optional[str] = None
     relevance_reasons: Optional[List[str]] = None
+    retrieved_at: Optional[str] = None  # 首次实际检索完成时间（UTC）；缓存读取不刷新
     
     def to_text(self) -> str:
         """转换为文本格式"""
@@ -142,6 +270,13 @@ class SearchResponse:
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
     
+    def mark_retrieved(self) -> None:
+        """Record actual acquisition once; preserve timestamps on cached/copied results."""
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        for result in self.results:
+            if result.retrieved_at is None:
+                result.retrieved_at = retrieved_at
+
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
         if not self.success or not self.results:
@@ -249,6 +384,7 @@ class BaseSearchProvider(ABC):
             response.search_time = time.time() - start_time
 
             if response.success:
+                response.mark_retrieved()
                 self._record_success(api_key)
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
@@ -325,7 +461,7 @@ class TavilySearchProvider(BaseSearchProvider):
             # 执行搜索（优化：使用advanced深度、限制最近几天）
             search_kwargs: Dict[str, Any] = {
                 "query": query,
-                "search_depth": "advanced",  # advanced 获取更多结果
+                "search_depth": "basic",  # 为控制credit使用，将advanced修改成basic
                 "max_results": max_results,
                 "include_answer": False,
                 "include_raw_content": False,
@@ -401,6 +537,7 @@ class TavilySearchProvider(BaseSearchProvider):
             response.search_time = time.time() - start_time
 
             if response.success:
+                response.mark_retrieved()
                 self._record_success(api_key)
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
@@ -442,7 +579,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
     - 免费版每月 100 次请求
     - 返回真实的搜索结果
     
-    文档：https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis
+    文档：https://serpapi.com/github-daily-stock-analysis
     """
 
     _ORGANIC_CONTENT_FETCH_LIMIT = 1
@@ -1085,7 +1222,7 @@ class AnspireSearchProvider(BaseSearchProvider):
     def __init__(self, api_keys: List[str]):
         super().__init__(api_keys, "Anspire")
     
-    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, region_mode: int = 0) -> SearchResponse:
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, region_mode: int = 2) -> SearchResponse:
         """执行 Anspire 搜索"""
         try:
             import requests
@@ -1718,10 +1855,20 @@ class SearXNGSearchProvider(BaseSearchProvider):
     _public_instances_stale_retry_after: float = 0.0
     _public_instances_lock = threading.Lock()
 
-    def __init__(self, base_urls: Optional[List[str]] = None, *, use_public_instances: bool = False):
+    def __init__(
+        self,
+        base_urls: Optional[List[str]] = None,
+        *,
+        use_public_instances: bool = False,
+        self_hosted_timeout_seconds: Optional[int] = None,
+    ):
         normalized_base_urls = [url.rstrip("/") for url in (base_urls or []) if url.strip()]
         super().__init__(normalized_base_urls, "SearXNG")
         self._base_urls = normalized_base_urls
+        if self_hosted_timeout_seconds and int(self_hosted_timeout_seconds) > 0:
+            self._self_hosted_timeout_seconds = int(self_hosted_timeout_seconds)
+        else:
+            self._self_hosted_timeout_seconds = self.SELF_HOSTED_TIMEOUT_SECONDS
         self._use_public_instances = bool(use_public_instances and not self._base_urls)
         self._cursor = 0
         self._cursor_lock = threading.Lock()
@@ -2032,7 +2179,7 @@ class SearXNGSearchProvider(BaseSearchProvider):
                 max_attempts=len(self._base_urls),
             )
             retry_enabled = True
-            timeout = self.SELF_HOSTED_TIMEOUT_SECONDS
+            timeout = self._self_hosted_timeout_seconds
             empty_error = "SearXNG 未配置可用实例"
         elif self._use_public_instances:
             public_instances = self._get_public_instances()
@@ -2071,6 +2218,7 @@ class SearXNGSearchProvider(BaseSearchProvider):
             )
             response.search_time = time.time() - start_time
             if response.success:
+                response.mark_retrieved()
                 logger.info(
                     "[%s] 搜索 '%s' 成功，实例=%s，返回 %s 条结果，耗时 %.2fs",
                     self.name,
@@ -2128,7 +2276,7 @@ class SearchService:
     NEWS_OVERSAMPLE_MAX = 10
     FUTURE_TOLERANCE_DAYS = 1
     ANALYTICAL_INTEL_LOOKBACK_DAYS = 180
-    ANALYTICAL_INTEL_DIMENSIONS = {"market_analysis", "earnings"}
+    ANALYTICAL_INTEL_DIMENSIONS = {"market_analysis", "earnings", "industry"}
     _CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
     _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
     _DIRECT_NEWS_CATEGORY = "direct_company_news"
@@ -2144,6 +2292,10 @@ class SearchService:
         "earnings", "revenue", "profit", "guidance", "filing", "buyback",
         "dividend", "lawsuit", "merger", "acquisition",
     )
+    _MAINLAND_ISSUER_CODE = (
+        r"(?<![A-Za-z0-9.])(?:00|20|30|43|60|68|81|82|83|87|88|90|92)\d{4}(?![A-Za-z0-9])"
+    )
+    _LABELED_ISSUER_CODE = re.compile(rf"(?:证券|股票)代码\s*[:：]?\s*({_MAINLAND_ISSUER_CODE})")
     _COMPANY_EVENT_TERMS = (
         "公告", "披露", "发布", "收购", "回购", "减持", "增持", "诉讼", "处罚",
         "业绩", "财报", "营收", "净利润", "分红", "董事会", "股东大会", "订单",
@@ -2264,7 +2416,8 @@ class SearchService:
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
-        searxng_public_instances_enabled: bool = True,
+        searxng_public_instances_enabled: bool = False,
+        searxng_timeout_seconds: Optional[int] = None,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2283,6 +2436,19 @@ class SearchService:
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
+        self._constructor_kwargs: Dict[str, Any] = {
+            "bocha_keys": list(bocha_keys or []),
+            "tavily_keys": list(tavily_keys or []),
+            "anspire_keys": list(anspire_keys or []),
+            "brave_keys": list(brave_keys or []),
+            "serpapi_keys": list(serpapi_keys or []),
+            "minimax_keys": list(minimax_keys or []),
+            "searxng_base_urls": list(searxng_base_urls or []),
+            "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
+            "searxng_timeout_seconds": searxng_timeout_seconds,
+            "news_max_age_days": int(news_max_age_days),
+            "news_strategy_profile": news_strategy_profile,
+        }
         self._providers: List[BaseSearchProvider] = []
         self.news_max_age_days = max(1, news_max_age_days)
         raw_profile = (news_strategy_profile or "short").strip().lower()
@@ -2322,15 +2488,21 @@ class SearchService:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
 
-        # 5. MiniMax（Coding Plan Web Search，结构化结果）
+        # 5. Anspire Search（可选，位于 SerpAPI 之后）
+        if anspire_keys:
+            self._providers.append(AnspireSearchProvider(anspire_keys))
+            logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
+
+        # 6. MiniMax（Coding Plan Web Search，结构化结果）
         if minimax_keys:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 7. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
+            self_hosted_timeout_seconds=searxng_timeout_seconds,
         )
         if searxng_provider.is_available:
             self._providers.append(searxng_provider)
@@ -2339,11 +2511,6 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
-        # 7. Anspire Search（实时智能搜索优化）
-        if anspire_keys:
-            self._providers.insert(0, AnspireSearchProvider(anspire_keys))
-            logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
-            
         if not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
@@ -2363,18 +2530,47 @@ class SearchService:
     
     @staticmethod
     def _is_foreign_stock(stock_code: str) -> bool:
-        """判断是否为港股或美股"""
-        code = stock_code.strip()
+        """判断是否为港股或美股。
+
+        Honours all canonical input forms — bare ticker (``AAPL`` / ``00700``),
+        suffixed ticker (``AAPL.US`` / ``00700.HK``), and prefixed HK ticker
+        (``HK00700``) — by canonicalizing to the key form used in
+        STOCK_ENGLISH_NAME_MAP before applying the existing structural checks.
+        This is the canonical-boundary unification that massif-01 asked for on
+        PR #2047 (so alias resolution and foreign-ness detection no longer
+        disagree on the same input).
+        """
+        code = canonicalize_foreign_stock_code(stock_code).strip()
+        if not code:
+            return False
         # 美股：1-5个大写字母，可能包含点（如 BRK.B）
         if SearchService._US_STOCK_RE.match(code):
             return True
-        # 港股：带 hk 前缀或 5位纯数字
-        lower = code.lower()
-        if lower.startswith('hk'):
-            return True
+        # 港股：5位纯数字。canonicalize_foreign_stock_code 已把 HK00700 前缀
+        # 与 00700.HK 后缀全部归一为 00700 形式，原 lower.startswith('hk')
+        # 分支在 canonical 之后为不可达死代码，已删除。
         if code.isdigit() and len(code) == 5:
             return True
         return False
+
+    @staticmethod
+    def _foreign_english_query_terms(stock_code: str, stock_name: str) -> Tuple[str, ...]:
+        """Return English company name(s) to embed in foreign-stock search
+        queries. issue #2026: When STOCK_NAME_MAP maps a foreign ticker to a
+        Chinese display name, the search layer must not pass that Chinese name
+        to English news providers, otherwise the provider misses English
+        headlines entirely.
+
+        Returns the canonical alias tuple from ``STOCK_ENGLISH_NAME_MAP`` if the
+        supplied ``stock_name`` is Chinese and the canonical ticker has English
+        aliases. Otherwise returns an empty tuple (callers fall back to
+        ``stock_name`` itself).
+
+        Kept deliberately small and read-only: this helper never mutates the
+        alias set and never invents aliases outside the single source of truth
+        in ``src/data/stock_mapping.py``.
+        """
+        return foreign_stock_english_aliases(stock_code, stock_name)
 
     @classmethod
     def _contains_chinese_text(cls, value: Optional[str]) -> bool:
@@ -2548,9 +2744,56 @@ class SearchService:
                 self._cache_inflight.pop(key, None)
                 event.set()
 
-    def _wait_for_cached(self, key: str, event: threading.Event) -> Optional['SearchResponse']:
-        event.wait(timeout=max(1.0, min(float(self._cache_ttl), 30.0)))
+    def _wait_for_cached(
+        self,
+        key: str,
+        event: threading.Event,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> Optional['SearchResponse']:
+        wait_seconds = (
+            max(1.0, min(float(self._cache_ttl), 30.0))
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
+        event.wait(timeout=wait_seconds)
         return self._get_cached(key)
+
+    def _get_cached_or_wait_for_reservation(
+        self,
+        key: str,
+        *,
+        deadline: Optional[float] = None,
+    ) -> Tuple[Optional['SearchResponse'], bool, Optional[threading.Event], bool]:
+        """Return a cache hit or exclusive ownership of one cache fill.
+
+        Waiters never proceed to provider work without becoming the owner. If
+        an owner finishes without a cacheable response, all waiters compete for
+        the next reservation and the losers keep waiting on that new owner.
+        """
+        waited = False
+        stock_token = get_current_stock_cancellation()
+        while True:
+            raise_if_stock_cancelled()
+            cached, cache_owner, cache_event = self._get_cached_or_reserve(key)
+            if cached is not None or cache_owner:
+                return cached, cache_owner, cache_event, waited
+            if cache_event is None:  # Defensive: the reservation API promises an event here.
+                raise RuntimeError("搜索缓存请求合并状态异常")
+            waited = True
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("题材新闻搜索等待超过调用截止时间")
+            if stock_token is not None:
+                remaining = min(remaining, 0.05) if remaining is not None else 0.05
+            if remaining is None:
+                cached = self._wait_for_cached(key, cache_event)
+            else:
+                cached = self._wait_for_cached(key, cache_event, timeout_seconds=remaining)
+            if cached is not None:
+                return cached, False, None, waited
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("题材新闻搜索等待超过调用截止时间")
 
     def _put_cache(self, key: str, response: 'SearchResponse') -> None:
         """Store a successful SearchResponse in cache."""
@@ -2958,8 +3201,8 @@ class SearchService:
         stock_name: str,
     ) -> SearchResult:
         """Attach conservative, explainable relevance metadata to one news item."""
-        title = item.title or ""
-        snippet = item.snippet or ""
+        title = unicodedata.normalize("NFKC", item.title or "")
+        snippet = unicodedata.normalize("NFKC", item.snippet or "")
         url = item.url or ""
         source = item.source or ""
         full_text = " ".join([title, snippet, url, source])
@@ -3025,6 +3268,58 @@ class SearchService:
                 add_reason(f"摘要命中公司名 {term}")
                 break
 
+        # Issue #2026: when STOCK_NAME_MAP maps a foreign ticker to a Chinese
+        # display name (e.g. AAPL -> 苹果), the loop above cannot match English
+        # news headlines ("Apple reports earnings beat"). Resolve English
+        # identity aliases from the single source of truth (STOCK_ENGLISH_NAME_MAP
+        # in src/data/stock_mapping.py — sibling of STOCK_NAME_MAP, asserted to
+        # be a subset of its foreign-ticker keys) and feed both the alias
+        # strings and their legal-suffix-stripped variants into the same
+        # identity-term scoring path.
+        english_aliases = foreign_stock_english_aliases(stock_code, stock_name)
+        if english_aliases:
+            # Issue #2026 / PR #2049 review: dedupe identity terms across all
+            # aliases BEFORE scoring. STOCK_ENGLISH_NAME_MAP legal alias
+            # (``Apple Inc.``) is intentionally designed to also expose its
+            # short alias (``Apple``) so the search-query construction path
+            # always has a concise term to put into English queries. But when
+            # the SAME short form appears both as an explicit alias tuple
+            # member AND as the cleaned output of _company_identity_terms on
+            # the legal alias, naive per-alias accumulation would double-count
+            # a single snippet hit on ``Apple`` (16+16=32) and push ambiguous
+            # snippet-only headlines over the direct_company_news threshold.
+            # Collect terms into a set first; score each unique term once.
+            seen_identity_terms: set = set()
+            for alias in english_aliases:
+                for term in cls._company_identity_terms(alias):
+                    if term in seen_identity_terms:
+                        continue
+                    seen_identity_terms.add(term)
+                    ambiguous_en = (
+                        not cls._contains_chinese_text(term)
+                        and term.lower() in cls._AMBIGUOUS_EN_COMPANY_NAMES
+                    )
+                    title_score = 26 if ambiguous_en else 45
+                    snippet_score = 16 if ambiguous_en else 28
+                    if cls._contains_identity_term(title, term):
+                        score += title_score
+                        direct_signal += title_score
+                        if ambiguous_en:
+                            has_ambiguous_company_signal = True
+                        else:
+                            has_unambiguous_company_signal = True
+                        add_reason(f"标题命中公司英文别名 {term}")
+                        break
+                    if cls._contains_identity_term(snippet, term):
+                        score += snippet_score
+                        direct_signal += snippet_score
+                        if ambiguous_en:
+                            has_ambiguous_company_signal = True
+                        else:
+                            has_unambiguous_company_signal = True
+                        add_reason(f"摘要命中公司英文别名 {term}")
+                        break
+
         has_company_event = cls._contains_any_news_term(full_text, cls._COMPANY_EVENT_TERMS)
         if has_company_event and direct_signal > 0:
             score += 12
@@ -3072,6 +3367,7 @@ class SearchService:
             relevance_score=score,
             relevance_category=category,
             relevance_reasons=reasons,
+            retrieved_at=item.retrieved_at,
         )
 
     @classmethod
@@ -3089,10 +3385,27 @@ class SearchService:
         if not response.success or not response.results:
             return response
 
-        scored_results = [
-            cls._score_news_relevance(item, stock_code=stock_code, stock_name=stock_name)
-            for item in response.results
-        ]
+        mainland_codes = {
+            term for term in cls._stock_code_identity_terms(stock_code)
+            if re.fullmatch(cls._MAINLAND_ISSUER_CODE, term)
+        }
+        scored_results = []
+        for item in response.results:
+            scored = cls._score_news_relevance(item, stock_code=stock_code, stock_name=stock_name)
+            title = unicodedata.normalize("NFKC", item.title or "").strip()
+            if mainland_codes and "公告" in title:
+                notice = f"{title} {unicodedata.normalize('NFKC', item.snippet or '')}"
+                issuer_codes = set(cls._LABELED_ISSUER_CODE.findall(notice))
+                if issuer_codes and mainland_codes.isdisjoint(issuer_codes):
+                    continue
+                generic_notice = title.lstrip("《").startswith("关于") or "交易异常波动" in title
+                if generic_notice and not issuer_codes and cls._is_trusted_official_news_source(item):
+                    mentioned_codes = set(re.findall(cls._MAINLAND_ISSUER_CODE, notice))
+                    if mentioned_codes and mainland_codes.isdisjoint(mentioned_codes):
+                        continue
+                    if scored.relevance_category != cls._DIRECT_NEWS_CATEGORY:
+                        continue
+            scored_results.append(scored)
 
         indexed_results = list(enumerate(scored_results))
 
@@ -3330,7 +3643,10 @@ class SearchService:
         now = datetime.now()
         local_tz = now.astimezone().tzinfo or timezone.utc
 
-        relative_date = cls._parse_relative_news_date(text, now)
+        try:
+            relative_date = cls._parse_relative_news_date(text, now)
+        except (OverflowError, ValueError):
+            relative_date = None
         if relative_date:
             return relative_date
 
@@ -3398,6 +3714,114 @@ class SearchService:
 
         return None
 
+    @staticmethod
+    def _dedup_title_key(title: Any) -> str:
+        text = unicodedata.normalize("NFKC", str(title or "")).strip().casefold()
+        text = text.replace("−", "-").replace("﹣", "-").replace("－", "-")
+        text = re.sub(r"([+-])\s+(?=\d|\.\d)", r"\1", text)
+        text = re.sub(r"(?<!\d)\.(?=\d)", "0.", text)
+        if not text:
+            return ""
+        compact: List[str] = []
+        for index, char in enumerate(text):
+            if char.isalnum() or "\u4e00" <= char <= "\u9fff" or char == "%":
+                compact.append(char)
+                continue
+            if char in "+-" and (
+                (index > 0 and text[index - 1].isdigit())
+                or (index + 1 < len(text) and text[index + 1].isdigit())
+            ):
+                compact.append(char)
+                continue
+            if char == "." and index > 0 and index + 1 < len(text):
+                if text[index - 1].isdigit() and text[index + 1].isdigit():
+                    compact.append(char)
+        return "".join(compact) or text
+
+    def _deduplicate_news_response(
+        self,
+        response: SearchResponse,
+        *,
+        max_results: int,
+    ) -> SearchResponse:
+        """Collapse equivalent titles without letting a weak copy win.
+
+        This is intentionally applied after freshness filtering and, where
+        possible, after relevance/admission filtering.  The provider result
+        order is not a quality signal: an undated download page can precede a
+        dated exchange announcement with the same title.
+        """
+        if not response.success or not response.results:
+            return response
+
+        selected: List[SearchResult] = []
+        selected_indexes: Dict[str, Dict[Optional[date], int]] = {}
+        for item in response.results:
+            key = self._dedup_title_key(item.title)
+            if not key:
+                selected.append(item)
+                continue
+
+            current_date = self._normalize_news_publish_date(item.published_date)
+            editions = selected_indexes.setdefault(key, {})
+            if current_date is None and editions and None not in editions:
+                # An undated copy cannot erase a dated edition.
+                continue
+            previous_date = current_date if current_date in editions else None
+            previous_index = editions.get(previous_date)
+            if previous_index is None:
+                editions[current_date] = len(selected)
+                selected.append(item)
+                continue
+
+            previous = selected[previous_index]
+            previous_official = self._is_trusted_official_news_source(previous)
+            current_official = self._is_trusted_official_news_source(item)
+            previous_bad = (
+                self._has_low_quality_news_page_signal(previous)
+                or self._has_adult_service_spam_news_page_signal(previous)
+            )
+            current_bad = (
+                self._has_low_quality_news_page_signal(item)
+                or self._has_adult_service_spam_news_page_signal(item)
+            )
+            previous_score = previous.relevance_score or 0
+            current_score = item.relevance_score or 0
+            if current_bad != previous_bad:
+                current_wins = not current_bad
+            elif previous.relevance_category != item.relevance_category and self._DIRECT_NEWS_CATEGORY in (
+                previous.relevance_category, item.relevance_category,
+            ):
+                current_wins = item.relevance_category == self._DIRECT_NEWS_CATEGORY
+            elif previous_date is None and current_date is not None:
+                current_wins = not current_bad
+            else:
+                current_wins = (
+                    (not previous_official and current_official)
+                    or (
+                        previous_score == 0
+                        and current_score > 0
+                        and not current_bad
+                    )
+                )
+            if current_wins:
+                selected[previous_index] = item
+                if previous_date != current_date:
+                    del editions[previous_date]
+                    editions[current_date] = previous_index
+
+        limited = selected[:max_results]
+        if len(limited) == len(response.results):
+            return response
+        return SearchResponse(
+            query=response.query,
+            results=limited,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
+
     def _filter_news_response(
         self,
         response: SearchResponse,
@@ -3406,6 +3830,7 @@ class SearchService:
         max_results: int,
         log_scope: str,
         keep_unknown: bool = False,
+        deduplicate: bool = True,
     ) -> SearchResponse:
         """Hard-filter results by published_date recency and normalize date strings."""
         if not response.success or not response.results:
@@ -3434,10 +3859,9 @@ class SearchService:
                             relevance_score=item.relevance_score,
                             relevance_category=item.relevance_category,
                             relevance_reasons=item.relevance_reasons,
+                            retrieved_at=item.retrieved_at,
                         )
                     )
-                    if len(filtered) >= max_results:
-                        break
                     continue
                 dropped_unknown += 1
                 continue
@@ -3458,10 +3882,23 @@ class SearchService:
                     relevance_score=item.relevance_score,
                     relevance_category=item.relevance_category,
                     relevance_reasons=item.relevance_reasons,
+                    retrieved_at=item.retrieved_at,
                 )
             )
-            if len(filtered) >= max_results:
-                break
+        filtered_response = SearchResponse(
+            query=response.query,
+            results=filtered,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
+        if deduplicate:
+            filtered_response = self._deduplicate_news_response(
+                filtered_response,
+                max_results=max_results,
+            )
+        filtered = filtered_response.results
 
         if dropped_unknown or dropped_old or dropped_future:
             logger.info(
@@ -3477,27 +3914,21 @@ class SearchService:
                 latest.isoformat(),
             )
 
-        return SearchResponse(
-            query=response.query,
-            results=filtered,
-            provider=response.provider,
-            success=response.success,
-            error_message=response.error_message,
-            search_time=response.search_time,
-        )
+        return filtered_response
 
     def _normalize_and_limit_response(
         self,
         response: SearchResponse,
         *,
         max_results: int,
+        deduplicate: bool = True,
     ) -> SearchResponse:
         """Normalize parseable dates without enforcing freshness filtering."""
         if not response.success or not response.results:
             return response
 
         normalized_results: List[SearchResult] = []
-        for item in response.results[:max_results]:
+        for item in response.results:
             normalized_date = self._normalize_news_publish_date(item.published_date)
             normalized_results.append(
                 SearchResult(
@@ -3511,10 +3942,10 @@ class SearchService:
                     relevance_score=item.relevance_score,
                     relevance_category=item.relevance_category,
                     relevance_reasons=item.relevance_reasons,
+                    retrieved_at=item.retrieved_at,
                 )
             )
-
-        return SearchResponse(
+        normalized_response = SearchResponse(
             query=response.query,
             results=normalized_results,
             provider=response.provider,
@@ -3522,6 +3953,9 @@ class SearchService:
             error_message=response.error_message,
             search_time=response.search_time,
         )
+        if not deduplicate:
+            return normalized_response
+        return self._deduplicate_news_response(normalized_response, max_results=max_results)
 
     @staticmethod
     def _limit_search_response(
@@ -3574,6 +4008,173 @@ class SearchService:
             record_count=record_count,
         )
 
+    def search_topic_news(
+        self,
+        topic: str,
+        max_results: int = 5,
+        focus_keywords: Optional[List[str]] = None,
+    ) -> SearchResponse:
+        """Search recent topic/sector news without applying single-stock identity filters."""
+        topic_text = (topic or "").strip()
+        if not topic_text or not self.is_available:
+            return SearchResponse(
+                query=topic_text,
+                results=[],
+                provider="None",
+                success=False,
+                error_message="未配置搜索能力或题材为空",
+            )
+
+        search_days = self._effective_news_window_days()
+        provider_max_results = self._provider_request_size(max_results)
+        query_terms = [str(item).strip() for item in (focus_keywords or []) if str(item).strip()]
+        query = " ".join(query_terms) if query_terms else f'"{topic_text}" A股 最新消息 催化'
+        prefer_chinese = self._contains_chinese_text(query)
+        cache_key = self._cache_key(f"topic_news:{topic_text}:{query}", max_results, search_days)
+        cached, cache_owner, cache_event, _waited = self._get_cached_or_wait_for_reservation(cache_key)
+        if cached is not None:
+            return cached
+
+        had_provider_success = False
+        try:
+            for provider in self._providers:
+                raise_if_stock_cancelled()
+                if not provider.is_available:
+                    continue
+                search_kwargs: Dict[str, Any] = {}
+                if isinstance(provider, TavilySearchProvider):
+                    search_kwargs["topic"] = "news"
+                elif isinstance(provider, BraveSearchProvider):
+                    search_kwargs.update(self._brave_search_locale("", prefer_chinese=prefer_chinese))
+
+                started_at = time.monotonic()
+                try:
+                    record_provider_run_started(
+                        data_type="news_search",
+                        provider=provider.name,
+                        operation="search_topic_news",
+                    )
+                    response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+                except Exception as exc:
+                    self._record_news_search_run(
+                        provider=provider.name,
+                        operation="search_topic_news",
+                        success=False,
+                        latency_ms=self._elapsed_ms(started_at),
+                        error_type=type(exc).__name__,
+                        error_message=exc,
+                    )
+                    logger.warning("%s 题材搜索失败: %s，尝试下一个引擎", provider.name, exc)
+                    continue
+
+                raise_if_stock_cancelled()
+                had_provider_success = had_provider_success or bool(response.success)
+                filtered = self._filter_news_response(
+                    response,
+                    search_days=search_days,
+                    max_results=provider_max_results,
+                    log_scope=f"{topic_text}:{provider.name}:topic_news",
+                    deduplicate=False,
+                )
+                if filtered.success and filtered.results:
+                    prioritized, _preferred_count = self._prioritize_news_language(
+                        filtered,
+                        prefer_chinese=prefer_chinese,
+                    )
+                    prioritized = self._filter_ranked_news_for_context(
+                        prioritized,
+                        log_scope=f"{topic_text}:{provider.name}:topic_news",
+                    )
+                    prioritized = self._deduplicate_news_response(
+                        prioritized,
+                        max_results=provider_max_results,
+                    )
+                    limited = self._limit_search_response(prioritized, max_results=max_results)
+                    if limited.results:
+                        self._record_news_search_run(
+                            provider=provider.name,
+                            operation="search_topic_news",
+                            success=True,
+                            latency_ms=self._elapsed_ms(started_at),
+                            record_count=len(limited.results),
+                        )
+                        self._put_cache(cache_key, limited)
+                        return limited
+
+                self._record_news_search_run(
+                    provider=provider.name,
+                    operation="search_topic_news",
+                    success=False,
+                    latency_ms=self._elapsed_ms(started_at),
+                    record_count=0,
+                    error_type="NoUsableNews",
+                    error_message=response.error_message or "过滤后无有效题材新闻",
+                )
+
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider="Filtered" if had_provider_success else "None",
+                success=had_provider_success,
+                error_message=None if had_provider_success else "所有搜索引擎都不可用或搜索失败",
+            )
+        finally:
+            if cache_owner and cache_event is not None:
+                self._release_cache_fill(cache_key, cache_event)
+
+    def search_topic_news_bounded(
+        self,
+        topic: str,
+        max_results: int = 5,
+        focus_keywords: Optional[List[str]] = None,
+        *,
+        timeout_seconds: float = 12.0,
+    ) -> SearchResponse:
+        """Search topic news within one cache-wait and provider deadline."""
+        topic_text = (topic or "").strip()
+        if not topic_text or not self.is_available:
+            return SearchResponse(
+                query=topic_text,
+                results=[],
+                provider="None",
+                success=False,
+                error_message="未配置搜索能力或题材为空",
+            )
+
+        wait_seconds = float(timeout_seconds)
+        if wait_seconds <= 0:
+            raise ValueError("题材新闻搜索超时必须大于 0 秒")
+        deadline = time.monotonic() + wait_seconds
+        search_days = self._effective_news_window_days()
+        query_terms = [str(item).strip() for item in (focus_keywords or []) if str(item).strip()]
+        query = " ".join(query_terms) if query_terms else f'"{topic_text}" A股 最新消息 催化'
+        cache_key = self._cache_key(f"topic_news:{topic_text}:{query}", max_results, search_days)
+        cached, cache_owner, cache_event, _waited = self._get_cached_or_wait_for_reservation(
+            cache_key,
+            deadline=deadline,
+        )
+        if cached is not None:
+            return cached
+
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("题材新闻搜索等待超过调用截止时间")
+            response = _call_topic_news_in_subprocess(
+                constructor_kwargs=self._constructor_kwargs,
+                topic=topic_text,
+                max_results=max_results,
+                focus_keywords=focus_keywords,
+                timeout_seconds=remaining,
+                deadline=deadline,
+            )
+            if response.success and response.results:
+                self._put_cache(cache_key, response)
+            return response
+        finally:
+            if cache_owner and cache_event is not None:
+                self._release_cache_fill(cache_key, cache_event)
+
     def search_stock_news(
         self,
         stock_code: str,
@@ -3605,25 +4206,49 @@ class SearchService:
 
         # 构建搜索查询（优化搜索效果）
         is_foreign = self._is_foreign_stock(stock_code)
+        # Issue #2026: When STOCK_NAME_MAP maps a foreign ticker to a Chinese
+        # display name (e.g. AAPL -> 苹果), the English news search query would
+        # otherwise contain the Chinese name and miss English headlines.
+        # Resolve the canonical English alias (single source of truth:
+        # STOCK_ENGLISH_NAME_MAP in src/data/stock_mapping.py) so the foreign
+        # query path uses a real English company name.
+        english_aliases = self._foreign_english_query_terms(stock_code, stock_name)
+        effective_name = english_aliases[0] if english_aliases else stock_name
+        short_name = english_aliases[-1] if english_aliases else None
+        # Issue #2026: Foreign tickers must bypass prefer_chinese even when the
+        # display name is Chinese (e.g. AAPL -> 苹果), otherwise the foreign
+        # branch below is unreachable and English headlines are missed.
+        prefer_chinese = prefer_chinese and not (is_foreign and english_aliases)
         if focus_keywords:
             # 如果提供了关键词，直接使用关键词作为查询
             query = " ".join(focus_keywords)
         elif prefer_chinese:
-            query = f"{stock_name} {stock_code} 股票 最新消息"
+            # 指数 target 的 stock_code 可能为空（Agent 工具 _resolve_search_subject
+            # 有意只传显示名），空 code 直接省略，避免拼出 "上证50  股票" 双空格。
+            query = (
+                f"{stock_name} {stock_code} 股票 最新消息"
+                if stock_code
+                else f"{stock_name} 股票 最新消息"
+            )
         elif is_foreign:
-            # 港股/美股使用英文搜索关键词
-            query = f"{stock_name} {stock_code} stock latest news"
+            # 港股/美股使用英文搜索关键词；优先使用英文公司名（issue #2026）
+            if english_aliases and short_name and short_name != effective_name:
+                query = (
+                    f"{effective_name} {short_name} {stock_code} stock latest news"
+                )
+            else:
+                query = f"{effective_name} {stock_code} stock latest news"
         else:
             # 默认主查询：股票名称 + 核心关键词
             query = f"{stock_name} {stock_code} 股票 最新消息"
 
+        subject_label = f"{stock_name}({stock_code})" if stock_code else stock_name
         logger.info(
             (
-                "搜索股票新闻: %s(%s), query='%s', 时间范围: 近%s天 "
+                "搜索股票新闻: %s, query='%s', 时间范围: 近%s天 "
                 "(profile=%s, NEWS_MAX_AGE_DAYS=%s, prefer_chinese=%s), 目标条数=%s, provider请求条数=%s"
             ),
-            stock_name,
-            stock_code,
+            subject_label,
             query,
             search_days,
             self.news_strategy_profile,
@@ -3641,12 +4266,17 @@ class SearchService:
             max_results,
             search_days,
         )
-        cached, cache_owner, cache_event = self._get_cached_or_reserve(cache_key)
+        cached, cache_owner, cache_event, waited = self._get_cached_or_wait_for_reservation(cache_key)
         if cached is not None:
-            logger.info(f"使用缓存搜索结果: {stock_name}({stock_code})")
+            logger.info(
+                "%s: %s(%s)",
+                "使用并发填充后的缓存搜索结果" if waited else "使用缓存搜索结果",
+                stock_name,
+                stock_code,
+            )
             self._record_news_search_run(
                 provider=cached.provider or "SearchCache",
-                operation="search_stock_news_cache",
+                operation="search_stock_news_cache_wait" if waited else "search_stock_news_cache",
                 success=bool(cached.success),
                 latency_ms=0,
                 record_count=len(cached.results or []),
@@ -3655,40 +4285,13 @@ class SearchService:
             )
             return cached
 
-        if not cache_owner and cache_event is not None:
-            cached = self._wait_for_cached(cache_key, cache_event)
-            if cached is not None:
-                logger.info(f"使用并发填充后的缓存搜索结果: {stock_name}({stock_code})")
-                self._record_news_search_run(
-                    provider=cached.provider or "SearchCache",
-                    operation="search_stock_news_cache_wait",
-                    success=bool(cached.success),
-                    latency_ms=0,
-                    record_count=len(cached.results or []),
-                    cache_hit=True,
-                    error_message=cached.error_message,
-                )
-                return cached
-            cached, cache_owner, cache_event = self._get_cached_or_reserve(cache_key)
-            if cached is not None:
-                logger.info(f"使用等待后命中的缓存搜索结果: {stock_name}({stock_code})")
-                self._record_news_search_run(
-                    provider=cached.provider or "SearchCache",
-                    operation="search_stock_news_cache_retry",
-                    success=bool(cached.success),
-                    latency_ms=0,
-                    record_count=len(cached.results or []),
-                    cache_hit=True,
-                    error_message=cached.error_message,
-                )
-                return cached
-
         try:
             # 依次尝试各个搜索引擎（若过滤后为空，继续尝试下一引擎）
             had_provider_success = False
             best_ranked_response: Optional[SearchResponse] = None
             best_ranked_stats: Optional[Dict[str, int]] = None
             for provider in self._providers:
+                raise_if_stock_cancelled()
                 if not provider.is_available:
                     continue
 
@@ -3721,11 +4324,13 @@ class SearchService:
                         error_message=exc,
                     )
                     raise
+                raise_if_stock_cancelled()
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
                     log_scope=f"{stock_code}:{provider.name}:stock_news",
+                    deduplicate=False,
                 )
                 had_provider_success = had_provider_success or bool(response.success)
 
@@ -3739,12 +4344,16 @@ class SearchService:
                         stock_code=stock_code,
                         stock_name=stock_name,
                         prefer_chinese=prefer_chinese,
-                        max_results=provider_max_results,
+                        max_results=len(language_response.results),
                         log_scope=f"{stock_code}:{provider.name}:stock_news",
                     )
                     admitted_response = self._filter_ranked_news_for_context(
                         ranked_response,
                         log_scope=f"{stock_code}:{provider.name}:stock_news",
+                    )
+                    admitted_response = self._deduplicate_news_response(
+                        admitted_response,
+                        max_results=provider_max_results,
                     )
                     limited_response = self._limit_search_response(
                         admitted_response,
@@ -3895,10 +4504,25 @@ class SearchService:
                 event_types = ["earnings report", "insider selling", "quarterly results"]
             else:
                 event_types = ["年报预告", "减持公告", "业绩快报"]
-        
+
+        # Issue #2026: foreign-ticker Chinese display name needs canonical
+        # English alias for English event query (single source of truth in
+        # src/data/stock_mapping.py).
+        english_aliases = self._foreign_english_query_terms(stock_code, stock_name)
+        effective_name = english_aliases[0] if english_aliases else stock_name
+
         # 构建针对性查询
         event_query = " OR ".join(event_types)
-        query = f"{stock_name} ({event_query})"
+        query = f"{effective_name} ({event_query})"
+        cache_key = self._cache_key(
+            f"stock_events:{query}|target={stock_code}:{stock_name}",
+            5,
+            0,
+        )
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            logger.info("使用缓存事件搜索结果: %s(%s)", stock_name, stock_code)
+            return cached
         
         logger.info(f"搜索股票事件: {stock_name}({stock_code}) - {event_types}")
         
@@ -3910,6 +4534,7 @@ class SearchService:
             response = provider.search(query, max_results=5)
             
             if response.success:
+                self._put_cache(cache_key, response)
                 return response
         
         return SearchResponse(
@@ -3949,17 +4574,25 @@ class SearchService:
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
         if is_foreign:
+            # Issue #2026: Foreign-ticker English alias resolution from the
+            # single source of truth (STOCK_ENGLISH_NAME_MAP in
+            # src/data/stock_mapping.py). When STOCK_NAME_MAP maps the ticker
+            # to a Chinese display name, the English news query path must use
+            # the canonical English company name; otherwise English news
+            # providers receive the Chinese name and miss English headlines.
+            english_aliases = self._foreign_english_query_terms(stock_code, stock_name)
+            effective_name = english_aliases[0] if english_aliases else stock_name
             search_dimensions = [
                 {
                     'name': 'latest_news',
-                    'query': f"{stock_name} {stock_code} latest news events",
+                    'query': f"{effective_name} {stock_code} latest news events",
                     'desc': '最新消息',
                     'tavily_topic': 'news',
                     'strict_freshness': True,
                 },
                 {
                     'name': 'market_analysis',
-                    'query': f"{stock_name} analyst rating target price report",
+                    'query': f"{effective_name} analyst rating target price report",
                     'desc': '机构分析',
                     'tavily_topic': None,
                     'strict_freshness': False,
@@ -3967,8 +4600,8 @@ class SearchService:
                 {
                     'name': 'risk_check',
                     'query': (
-                        f"{stock_name} {stock_code} index performance outlook tracking error"
-                        if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
+                        f"{effective_name} {stock_code} index performance outlook tracking error"
+                        if is_index_etf else f"{effective_name} risk insider selling lawsuit litigation"
                     ),
                     'desc': '风险排查',
                     'tavily_topic': None if is_index_etf else 'news',
@@ -3977,8 +4610,8 @@ class SearchService:
                 {
                     'name': 'earnings',
                     'query': (
-                        f"{stock_name} {stock_code} index performance composition outlook"
-                        if is_index_etf else f"{stock_name} earnings revenue profit growth forecast"
+                        f"{effective_name} {stock_code} index performance composition outlook"
+                        if is_index_etf else f"{effective_name} earnings revenue profit growth forecast"
                     ),
                     'desc': '业绩预期',
                     'tavily_topic': None,
@@ -3987,8 +4620,8 @@ class SearchService:
                 {
                     'name': 'industry',
                     'query': (
-                        f"{stock_name} {stock_code} index sector allocation holdings"
-                        if is_index_etf else f"{stock_name} industry competitors market share outlook"
+                        f"{effective_name} {stock_code} index sector allocation holdings"
+                        if is_index_etf else f"{effective_name} industry competitors market share outlook"
                     ),
                     'desc': '行业分析',
                     'tavily_topic': None,
@@ -4077,6 +4710,7 @@ class SearchService:
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
+            raise_if_stock_cancelled()
             
             # 选择搜索引擎（轮流使用）
             available_providers = [p for p in self._providers if p.is_available]
@@ -4112,11 +4746,13 @@ class SearchService:
                     max_results=provider_max_results,
                     days=request_days,
                 )
+            raise_if_stock_cancelled()
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
+                    deduplicate=False,
                     log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
                 )
             elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
@@ -4125,24 +4761,30 @@ class SearchService:
                     search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
                     max_results=provider_max_results,
                     keep_unknown=True,
+                    deduplicate=False,
                     log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
                 )
             else:
                 filtered_response = self._normalize_and_limit_response(
                     response,
                     max_results=provider_max_results,
+                    deduplicate=False,
                 )
             filtered_response = self._rank_news_response(
                 filtered_response,
                 stock_code=stock_code,
                 stock_name=stock_name,
                 prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
-                max_results=provider_max_results,
+                max_results=len(filtered_response.results),
                 log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
             )
             filtered_response = self._filter_ranked_news_for_context(
                 filtered_response,
                 log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
+            )
+            filtered_response = self._deduplicate_news_response(
+                filtered_response,
+                max_results=provider_max_results,
             )
             filtered_response = self._limit_search_response(
                 filtered_response,
@@ -4204,7 +4846,23 @@ class SearchService:
             if resp.success and resp.results:
                 # 增加显示条数
                 for i, r in enumerate(resp.results[:4], 1):
-                    date_str = f" [{r.published_date}]" if r.published_date else ""
+                    if r.published_date:
+                        pub_date = SearchService._normalize_news_publish_date(r.published_date)
+                        if pub_date is not None:
+                            age_days = (datetime.now().date() - pub_date).days
+                            if age_days == -1:
+                                age_label = "明日"
+                            elif age_days < -1:
+                                age_label = f"{abs(age_days)}天后"
+                            elif age_days == 0:
+                                age_label = "今日"
+                            else:
+                                age_label = f"{age_days}天前"
+                            date_str = f" [{r.published_date} · {age_label}]"
+                        else:
+                            date_str = f" [{r.published_date} · 日期未知·勿作短期催化]"
+                    else:
+                        date_str = " [日期未知·勿作短期催化]"
                     lines.append(f"  {i}. {r.title}{date_str}")
                     # 如果摘要太短，可能信息量不足
                     snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
@@ -4455,6 +5113,7 @@ def get_search_service() -> SearchService:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    searxng_timeout_seconds=getattr(config, "searxng_timeout_seconds", None),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
